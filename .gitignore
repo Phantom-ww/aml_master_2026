@@ -1,0 +1,24 @@
+
+# данные и модели (большие файлы)
+data/
+backend/data/
+*.parquet
+*.csv
+*.npz
+
+# зависимости и сборка
+node_modules/
+frontend/dist/
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# секреты и системное
+.env
+*.env
+.DS_Store
+*.log
+*.db
+*.zip

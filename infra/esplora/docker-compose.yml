@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  bitcoind:
+    image: btcpayserver/bitcoin:27.0
+    container_name: bitcoind
+    restart: unless-stopped
+    volumes:
+      - bitcoin_data:/data
+    ports:
+      - "8333:8333"  # P2P
+      - "8332:8332"  # RPC
+    environment:
+      BITCOIN_NETWORK: ${BITCOIN_NETWORK:-signet}
+      BITCOIN_EXTRA_ARGS: |
+        server=1
+        txindex=1
+        zmqpubrawblock=tcp://0.0.0.0:28332
+        zmqpubrawtx=tcp://0.0.0.0:28333
+        rpcallowip=0.0.0.0/0
+        rpcbind=0.0.0.0
+        rpcuser=${RPC_USER:-bitcoin}
+        rpcpassword=${RPC_PASSWORD:-changeme}
+    networks:
+      - esplora_net
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-rpcuser=${RPC_USER:-bitcoin}", "-rpcpassword=${RPC_PASSWORD:-changeme}", "getblockchaininfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  electrs:
+    image: getumbrel/electrs:v0.10.5
+    container_name: electrs
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    volumes:
+      - electrs_data:/data
+    ports:
+      - "50001:50001"  # Electrum TCP
+      - "3000:3000"    # Esplora HTTP API
+    environment:
+      ELECTRS_LOG_FILTERS: info
+      ELECTRS_NETWORK: ${ELECTRS_NETWORK:-signet}
+      ELECTRS_DAEMON_RPC_ADDR: bitcoind:8332
+      ELECTRS_DAEMON_P2P_ADDR: bitcoind:8333
+      ELECTRS_ELECTRUM_RPC_ADDR: 0.0.0.0:50001
+      ELECTRS_HTTP_ADDR: 0.0.0.0:3000
+      ELECTRS_JSONRPC_IMPORT: "true"
+      ELECTRS_INDEX_UNSPENDABLES: "true"
+      ELECTRS_COOKIE: "${RPC_USER:-bitcoin}:${RPC_PASSWORD:-changeme}"
+    networks:
+      - esplora_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/blocks/tip/height"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s  # Give it 5 minutes to start indexing
+
+volumes:
+  bitcoin_data:
+    driver: local
+  electrs_data:
+    driver: local
+
+networks:
+  esplora_net:
+    driver: bridge

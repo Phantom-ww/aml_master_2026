@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  bitcoind:
+    image: lncm/bitcoind:v27.0
+    container_name: aml-bitcoind
+    volumes:
+      - bitcoin_data:/data/.bitcoin
+    networks:
+      - chain-network
+    command: >
+      bitcoind
+      -chain=${BTC_NETWORK}
+      -server=1
+      -txindex=1
+      -rpcuser=aml
+      -rpcpassword=amlpass
+      -rpcallowip=172.30.0.0/16
+      -rpcbind=0.0.0.0
+      -zmqpubrawblock=tcp://0.0.0.0:28332
+      -zmqpubrawtx=tcp://0.0.0.0:28333
+      -maxconnections=40
+      -dbcache=512
+      -prune=0
+    ports:
+      - "${RPC_PORT}:${RPC_PORT}"
+      - "${P2P_PORT}:${P2P_PORT}"
+    environment:
+      - BTC_NETWORK=${BTC_NETWORK}
+    restart: unless-stopped
+
+  electrs:
+    image: blockstream/electrs:latest
+    container_name: aml-electrs
+    depends_on:
+      - bitcoind
+    volumes:
+      - electrs_data:/data
+    networks:
+      - chain-network
+    command: >
+      electrs
+      --network=${BTC_NETWORK}
+      --daemon-rpc-addr=bitcoind:${RPC_PORT}
+      --cookie=aml:amlpass
+      --db-dir=/data
+      --http-addr=0.0.0.0:3000
+      --electrum-rpc-addr=0.0.0.0:50001
+      --index-lookup-limit=1000
+      --cors=*
+    ports:
+      - "3000:3000"
+      - "50001:50001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/blocks/tip/height"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+networks:
+  chain-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+volumes:
+  bitcoin_data:
+  electrs_data:
