@@ -37,11 +37,7 @@ def _score_model_block(address: str, wallet: dict, source: str | None = None):
     in_sample = model_svc.get_in_sample(address)
 
     block = {
-        "xgb": {
-            "prob": xgb_result["prob"],
-            "flag": xgb_result["flag"],
-            "explanations": xgb_result["explanations"],
-        } if xgb_result else None,
+        "xgb": xgb_result if xgb_result else None,
         "gnn": gnn_result if gnn_result else None,
         "ms": ms,
         "model_version": model_svc._bundle.meta["model_version"],
@@ -168,7 +164,8 @@ def get_tx_details(txId: str):
                         "raw": tx_result["raw"],
                         "base_value": tx_result["base_value"],
                         "top": tx_result["top"],
-                        "groups": tx_result["groups"]
+                        "groups": tx_result["groups"],
+                        "decomposition": tx_result.get("decomposition")
                     }
                 }
         except (ValueError, TypeError):

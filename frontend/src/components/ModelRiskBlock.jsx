@@ -3,7 +3,7 @@ import FeatureChart from './FeatureChart';
 import { formatProb, riskColor } from './riskUtils';
 import apiClient from '../api/client';
 
-function RiskRow({ name, hint, result }) {
+function RiskRow({ name, hint, result, decomposition }) {
   if (!result) {
     return (
       <div className="flex items-center justify-between text-sm">
@@ -13,13 +13,20 @@ function RiskRow({ name, hint, result }) {
     );
   }
   const color = riskColor(result.prob);
+  const thresholdTitle = decomposition
+    ? `Threshold ≈ ${formatProb(decomposition.threshold_calibrated)} (best F1 on validation)`
+    : undefined;
+
   return (
     <div className="space-y-1">
       <div className="flex items-center justify-between text-sm">
         <span className="text-gray-300" title={hint}>{name}</span>
         <span className="flex items-center gap-2">
           {result.flag && (
-            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-900/40 text-red-300 border border-red-700/50">
+            <span
+              className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-900/40 text-red-300 border border-red-700/50"
+              title={thresholdTitle}
+            >
               Above threshold
             </span>
           )}
@@ -98,7 +105,7 @@ function ModelRiskBlock({ model, dataSource, address, onAddWallet }) {
 
       <div className="bg-surface-2 rounded-lg p-3 space-y-3">
         <RiskRow name="GraphSAGE (GNN)" hint="Wallet behaviour + its neighbours in the transaction graph" result={model.gnn} />
-        <RiskRow name="XGBoost" hint="Wallet's own behaviour only" result={model.xgb} />
+        <RiskRow name="XGBoost" hint="Wallet's own behaviour only" result={model.xgb} decomposition={model.xgb?.decomposition} />
         <div className="flex items-center justify-between text-[11px] text-gray-500">
           <span>Probability that the wallet is illicit</span>
           {model.ms != null && <span>computed in {model.ms} ms</span>}
@@ -147,7 +154,7 @@ function ModelRiskBlock({ model, dataSource, address, onAddWallet }) {
           {explanationTab === 'xgboost' && model.xgb?.explanations?.length > 0 && (
             <div>
               <div className="text-xs text-gray-500 mb-2">SHAP values (log-odds)</div>
-              <FeatureChart features={model.xgb.explanations} />
+              <FeatureChart features={model.xgb.explanations} decomposition={model.xgb.decomposition} />
             </div>
           )}
 

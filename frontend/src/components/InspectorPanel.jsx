@@ -787,7 +787,10 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                             {/* Top features */}
                             {details.tx_model.explanation.top && details.tx_model.explanation.top.length > 0 && (
                               <div>
-                                <FeatureChart features={details.tx_model.explanation.top} />
+                                <FeatureChart
+                                  features={details.tx_model.explanation.top}
+                                  decomposition={details.tx_model.explanation.decomposition}
+                                />
                                 <div className="text-xs text-gray-500 mt-2">
                                   Most transaction features are anonymised by Elliptic; group totals show where the signal comes from.
                                 </div>

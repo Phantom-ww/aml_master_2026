@@ -66,16 +66,40 @@ class ModelBundle:
         d = xgb.DMatrix(X, feature_names=names)
         rng = _best_range(booster)
         raw = booster.predict(d, iteration_range=rng)
-        contrib = booster.predict(d, pred_contribs=True, iteration_range=rng)[:, :-1] if top_k else None
+        contrib_full = booster.predict(d, pred_contribs=True, iteration_range=rng) if top_k else None
         out = []
         for i in range(len(rows)):
-            res = {"prob": float(_calibrate(raw[i], self.calibration[cal_key])), "raw": float(raw[i]),
+            prob_calibrated = float(_calibrate(raw[i], self.calibration[cal_key]))
+            res = {"prob": prob_calibrated, "raw": float(raw[i]),
                    "flag": bool(raw[i] >= self.thresholds[thr_key]),
                    "model_version": self.meta["model_version"]}
             if top_k:
-                order = np.argsort(-np.abs(contrib[i]))[:top_k]
+                contrib = contrib_full[i, :-1]
+                base_value = float(contrib_full[i, -1])
+                order = np.argsort(-np.abs(contrib))[:top_k]
+                shown_indices = order
+                shown_sum = float(np.sum(contrib[shown_indices]))
+                other_indices = np.setdiff1d(np.arange(len(contrib)), shown_indices)
+                other_sum = float(np.sum(contrib[other_indices]))
+                other_count = int(len(other_indices))
+                logit = float(base_value + shown_sum + other_sum)
+                raw_prob = float(1.0 / (1.0 + np.exp(-logit)))
+                threshold_raw = float(self.thresholds[thr_key])
+                threshold_calibrated = float(_calibrate(threshold_raw, self.calibration[cal_key]))
+
                 res["explanations"] = [{"feature": names[j], "value": float(X[i, j]),
-                                        "shap": float(contrib[i, j])} for j in order]
+                                        "shap": float(contrib[j])} for j in order]
+                res["decomposition"] = {
+                    "base_value": base_value,
+                    "shown_sum": shown_sum,
+                    "other_sum": other_sum,
+                    "other_count": other_count,
+                    "logit": logit,
+                    "raw_prob": raw_prob,
+                    "prob": prob_calibrated,
+                    "threshold_raw": threshold_raw,
+                    "threshold_calibrated": threshold_calibrated
+                }
             out.append(res)
         return out
 
@@ -107,6 +131,8 @@ class ModelBundle:
         base_value = float(contrib_full[-1])
         prob = float(_calibrate(raw_margin, self.calibration["tx"]))
         flag = bool(raw_margin >= self.thresholds["tx_raw"])
+        threshold_raw = float(self.thresholds["tx_raw"])
+        threshold_calibrated = float(_calibrate(threshold_raw, self.calibration["tx"]))
 
         # Categorize features
         interpretable = [
@@ -131,6 +157,7 @@ class ModelBundle:
         # Top-k features overall
         order = np.argsort(-np.abs(contrib))[:top_k]
         top_features = []
+        shown_indices = order
         for j in order:
             name = names[j]
             if name in interpretable:
@@ -149,6 +176,14 @@ class ModelBundle:
                 "shap": float(contrib[j])
             })
 
+        # Compute decomposition
+        shown_sum = float(np.sum(contrib[shown_indices]))
+        other_indices = np.setdiff1d(np.arange(len(contrib)), shown_indices)
+        other_sum = float(np.sum(contrib[other_indices]))
+        other_count = int(len(other_indices))
+        logit = float(base_value + shown_sum + other_sum)
+        raw_prob = float(1.0 / (1.0 + np.exp(-logit)))
+
         # Group sums
         groups = []
         for group_name in ["Local (anonymised)", "Neighbour aggregates (anonymised)", "Elliptic++ (interpretable)"]:
@@ -163,7 +198,18 @@ class ModelBundle:
             "base_value": base_value,
             "top": top_features,
             "groups": groups,
-            "model_version": self.meta["model_version"]
+            "model_version": self.meta["model_version"],
+            "decomposition": {
+                "base_value": base_value,
+                "shown_sum": shown_sum,
+                "other_sum": other_sum,
+                "other_count": other_count,
+                "logit": logit,
+                "raw_prob": raw_prob,
+                "prob": prob,
+                "threshold_raw": threshold_raw,
+                "threshold_calibrated": threshold_calibrated
+            }
         }
 
 
