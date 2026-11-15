@@ -95,6 +95,10 @@ class APIClient {
     return this.get(`/api/chain/address/${address}/mixing`);
   }
 
+  async getChainWalletLiveScore(address) {
+    return this.get(`/api/chain/wallet/${address}/live-score`);
+  }
+
   // Investigation endpoints
   async listInvestigations(analystId = 'default') {
     return this.get(`/api/investigations?analyst_id=${analystId}`);

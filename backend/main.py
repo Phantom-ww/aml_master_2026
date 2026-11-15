@@ -105,6 +105,15 @@ async def lifespan(app: FastAPI):
     else:
         print(f"Model service not ready: {model_svc.load_error}")
 
+    # Initialize live chain model service
+    from services.live_model import get_service as get_live_model_service
+    live_svc = get_live_model_service()
+    live_svc.load(settings.live_model_dir)
+    if live_svc.is_ready:
+        print(f"Live model service ready: {live_svc.model_version}")
+    else:
+        print(f"Live model not ready: {live_svc.load_error}")
+
     # Initialize chain services if enabled
     if settings.chain_enabled:
         try:
@@ -475,6 +484,80 @@ async def get_chain_wallet(
     except Exception as e:
         print(f"Chain wallet error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.get("/api/chain/wallet/{address}/live-score")
+async def get_chain_wallet_live_score(
+    address: str,
+    source: EsploraSource = Depends(require_chain_source),
+):
+    """Experimental live-chain wallet risk score.
+
+    Fetches the full confirmed transaction history, computes scale-free
+    features, scores them with the live XGBoost model, and runs the OOD check.
+    Returns 503 if the live model is not loaded.
+    """
+    import time as _time
+    from chain.history_fetch import fetch_confirmed_txs
+    from chain.live_features import live_features_from_txs
+    from services.live_model import get_service as get_live_model_service
+
+    t0 = _time.monotonic()
+
+    live_svc = get_live_model_service()
+    if not live_svc.is_ready:
+        raise HTTPException(status_code=503, detail="Live model not available")
+
+    mode = settings.live_feature_mode
+    window = settings.live_feature_window_txs
+
+    try:
+        source.validate_address(address)
+    except InvalidAddress as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        all_txs, truncated = await fetch_confirmed_txs(
+            address, source, max_txs=settings.live_max_txs
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Chain unavailable: {e}")
+
+    # Select txs for feature computation according to the feature mode.
+    if mode == "window":
+        feature_txs = all_txs[:window]  # Esplora returns most-recent first
+    else:
+        feature_txs = all_txs
+
+    if not feature_txs:
+        raise HTTPException(
+            status_code=422,
+            detail="Address has no confirmed transactions — cannot score",
+        )
+
+    features, base_stats = live_features_from_txs(address, feature_txs)
+
+    scored = live_svc.score(features, use_recalibration=settings.live_use_recalibration)
+    ood_result = live_svc.ood(features, base_stats)
+
+    ms = round((_time.monotonic() - t0) * 1000, 1)
+
+    return {
+        "model_version": live_svc.model_version,
+        "experimental": True,
+        "mode": mode,
+        "n_txs_fetched": len(all_txs),
+        "n_txs_used": len(feature_txs),
+        "truncated": truncated,
+        "prob": scored["prob"],
+        "raw": scored["raw"],
+        "flag": scored["flag"],
+        "explanations": scored["explanations"],
+        "decomposition": scored["decomposition"],
+        "ood": ood_result,
+        "ms": ms,
+    }
+
 
 @app.get("/api/chain/address/{address}", response_model=NodeDetailsResponse)
 async def get_chain_address(

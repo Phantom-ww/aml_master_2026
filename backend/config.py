@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     # OFAC sanctioned BTC addresses
     ofac_btc_csv: str = "./data/labels/ofac_btc.csv"
 
+    # Live Chain model
+    live_model_dir: str = "./data/ellipticpp"
+    live_max_txs: int = 500          # LIVE_MAX_TXS: max confirmed txs to fetch per address
+    live_feature_mode: str = "window"  # LIVE_FEATURE_MODE: "window" | "full"
+    live_feature_window_txs: int = 10  # LIVE_FEATURE_WINDOW_TXS: txs used in window mode
+    live_use_recalibration: bool = False  # LIVE_USE_RECALIBRATION: apply Platt recalibration
+
     class Config:
         env_file = ".env"
         case_sensitive = False

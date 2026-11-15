@@ -1,7 +1,109 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import FeatureChart from './FeatureChart';
 import { formatProb, riskColor } from './riskUtils';
 import apiClient from '../api/client';
+
+// Per-address cache for live scores to avoid re-fetching on re-renders.
+const _liveScoreCache = new Map();
+
+function LiveScoreBlock({ address }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [liveScore, setLiveScore] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      // Cache hit — show immediately, no loading state.
+      if (_liveScoreCache.has(address)) {
+        setLiveScore(_liveScoreCache.get(address));
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await apiClient.getChainWalletLiveScore(address);
+        if (cancelled) return;
+        _liveScoreCache.set(address, result);
+        setLiveScore(result);
+      } catch (err) {
+        if (cancelled) return;
+        // 503 → model not loaded; surface plainly.
+        const is503 = err.message === 'Service Unavailable' || err.message === 'Live model not available';
+        setError(is503 ? 'Live model not loaded — score unavailable' : `Failed to load live score: ${err.message}`);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, [address]);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-gray-400 text-sm">Fraud risk — live model</div>
+        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-300 border border-yellow-700/50">
+          experimental
+        </span>
+      </div>
+
+      {loading && (
+        <div className="text-gray-400 text-sm animate-pulse">Loading live risk score…</div>
+      )}
+
+      {!loading && error && (
+        <div className="text-gray-500 text-sm">{error}</div>
+      )}
+
+      {!loading && !error && liveScore && (
+        <div className="space-y-3">
+          <div className="bg-surface-2 rounded-lg p-3 space-y-3">
+            <RiskRow
+              name="Live XGBoost"
+              hint="Scale-free features from recent transactions"
+              result={liveScore}
+              decomposition={liveScore.decomposition}
+            />
+            <div className="flex items-center justify-between text-[11px] text-gray-500">
+              <span>Computed on the last {liveScore.n_txs_used} txs ({liveScore.mode} mode)</span>
+              {liveScore.ms != null && <span>computed in {liveScore.ms} ms</span>}
+            </div>
+          </div>
+
+          {liveScore.ood?.flag && (
+            <div className="text-sm text-yellow-300 bg-yellow-900/20 border border-yellow-700/40 rounded p-2 mb-2">
+              ⚠ Out of training distribution — score unreliable
+              {liveScore.ood.out_of_range?.length > 0 && (
+                <div className="text-[11px] text-yellow-200/70 mt-1 space-y-0.5">
+                  {liveScore.ood.out_of_range.map((o, i) => (
+                    <div key={i}>
+                      {o.label}: {(o.value ?? 0).toFixed(4)} (training range: {(o.low ?? 0).toFixed(4)} – {(o.high ?? 0).toFixed(4)})
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {liveScore.explanations?.length > 0 && (
+            <div>
+              <div className="text-xs text-gray-500 mb-2">Why: Live XGBoost</div>
+              <FeatureChart features={liveScore.explanations} decomposition={liveScore.decomposition} />
+            </div>
+          )}
+
+          <div className="text-[11px] text-gray-500">
+            Trained on Elliptic++ (2016–2017) with scale-free features. Experimental: validation is ongoing.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RiskRow({ name, hint, result, decomposition }) {
   if (!result) {
@@ -80,12 +182,13 @@ function ModelRiskBlock({ model, dataSource, address, onAddWallet }) {
   };
 
   if (!model) {
+    if (dataSource === 'chain') {
+      return <LiveScoreBlock address={address} />;
+    }
     return (
       <div>
         <div className="text-gray-400 text-sm mb-1">Fraud risk (model)</div>
-        <div className="text-gray-500 text-sm">
-          {dataSource === 'chain' ? 'Not scored — address is not in Elliptic++' : 'Model not available'}
-        </div>
+        <div className="text-gray-500 text-sm">Model not available</div>
       </div>
     );
   }
