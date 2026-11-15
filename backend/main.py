@@ -6,6 +6,8 @@ from functools import lru_cache
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import time
+import csv
+import os
 
 from database import get_db, init_db, Investigation
 from schemas import (
@@ -36,6 +38,44 @@ if settings.chain_enabled:
 chain_source: Optional[EsploraSource] = None
 chain_cache: Optional[ChainCache] = None
 
+# ---------------------------------------------------------------------------
+# OFAC sanctioned BTC addresses
+# ---------------------------------------------------------------------------
+_ofac_btc: dict = {}      # address -> {"entity": str, "program": str}
+_ofac_available: bool = False
+
+
+def _load_ofac_btc() -> None:
+    global _ofac_btc, _ofac_available
+    csv_path = settings.ofac_btc_csv
+    if not os.path.exists(csv_path):
+        print(f"OFAC BTC list not found at {csv_path} — sanctions checking unavailable")
+        return
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                _ofac_btc[row["address"]] = {
+                    "entity": row.get("entity", ""),
+                    "program": row.get("program", ""),
+                }
+        _ofac_available = True
+        print(f"Loaded {len(_ofac_btc)} OFAC sanctioned BTC addresses")
+    except Exception as exc:
+        print(f"Failed to load OFAC BTC list: {exc} — sanctions checking unavailable")
+
+
+def _ofac_check(addresses: List[str]) -> dict:
+    """Return sanctions summary for a list of addresses."""
+    if not _ofac_available:
+        return {"available": False}
+    hits = [
+        {"address": a, "entity": _ofac_btc[a]["entity"]}
+        for a in addresses
+        if a in _ofac_btc
+    ]
+    return {"available": True, "hits": hits}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup, close on shutdown"""
@@ -44,6 +84,9 @@ async def lifespan(app: FastAPI):
     # Initialize database
     init_db()
     print("Database initialized")
+
+    # Load OFAC BTC sanctions list
+    _load_ofac_btc()
 
     # Initialize Elliptic++ service
     epp_svc = get_ellipticpp_service()
@@ -320,6 +363,10 @@ async def get_chain_subgraph(
         # Transform transactions to GraphEdges
         edges = []
         for txid, tx in subgraph.transactions.items():
+            from chain.coinjoin import detect_coinjoin
+            cj = detect_coinjoin(tx)
+            is_cj = cj.get("is_coinjoin", False)
+            cj_type = cj.get("type")
             # Each tx creates edges between input addresses and output addresses
             input_addrs = [inp.address for inp in tx.inputs if inp.address]
             output_addrs = [out.address for out in tx.outputs if out.address]
@@ -337,7 +384,9 @@ async def get_chain_subgraph(
                             "timestamp": datetime.fromtimestamp(tx.block_time, tz=timezone.utc).isoformat() if tx.block_time else None,
                             "data_source": "chain",
                             "block_height": tx.block_height,
-                            "confirmed": tx.block_height is not None
+                            "confirmed": tx.block_height is not None,
+                            "is_coinjoin": is_cj,
+                            "coinjoin_type": cj_type,
                         })
 
         return SubgraphResponse(
@@ -390,11 +439,32 @@ async def get_chain_wallet(
             "model_risk": model_risk
         }
 
+        # Collect all addresses appearing in this wallet's loaded transactions
+        all_addrs: set = set()
+        for tx in addr_data.txs:
+            for inp in tx.inputs:
+                if inp.address and inp.address != address:
+                    all_addrs.add(inp.address)
+            for out in tx.outputs:
+                if out.address and out.address != address:
+                    all_addrs.add(out.address)
+
+        # Sanctions
+        self_check = _ofac_check([address])
+        cp_check = _ofac_check(list(all_addrs))
+        sanctions = {
+            "available": _ofac_available,
+            "listed": bool(self_check.get("hits")),
+            "entity": self_check["hits"][0]["entity"] if self_check.get("hits") else None,
+            "counterparties_listed": cp_check.get("hits", []),
+        }
+
         return SubgraphResponse(
             nodes=[node],
             edges=[],
             center_node=address,
-            source="chain"
+            source="chain",
+            sanctions=sanctions,
         )
     except InvalidAddress as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -451,6 +521,9 @@ async def get_chain_address(
             from datetime import datetime
             timestamp = datetime.fromtimestamp(tx.block_time).isoformat() if tx.block_time else None
 
+            from chain.coinjoin import detect_coinjoin
+            cj = detect_coinjoin(tx)
+
             transactions.append({
                 "txid": tx.txid,
                 "amount_btc": amount_sat / 100_000_000,
@@ -458,7 +531,8 @@ async def get_chain_address(
                 "confirmed": tx.block_height is not None,
                 "block_height": tx.block_height,
                 "is_self_send": direction == "self",
-                "direction": direction
+                "direction": direction,
+                "coinjoin": cj,
             })
 
         # Calculate next_cursor: last confirmed transaction's txid, or None
@@ -539,6 +613,8 @@ async def get_chain_address_txs_page(
             timestamp = datetime.fromtimestamp(tx.block_time).isoformat() if tx.block_time else None
 
             from schemas import TransactionSummary
+            from chain.coinjoin import detect_coinjoin
+            cj = detect_coinjoin(tx)
             transactions.append(TransactionSummary(
                 txid=tx.txid,
                 amount_btc=amount_sat / 100_000_000,
@@ -546,7 +622,8 @@ async def get_chain_address_txs_page(
                 confirmed=tx.block_height is not None,
                 block_height=tx.block_height,
                 is_self_send=direction == "self",
-                direction=direction
+                direction=direction,
+                coinjoin=cj,
             ))
 
         return TransactionPageResponse(
@@ -608,9 +685,12 @@ async def get_chain_tx(
 
         # Format block time as ISO
         from datetime import datetime, timezone
+        from chain.coinjoin import detect_coinjoin
         block_time_iso = None
         if tx.block_time:
             block_time_iso = datetime.fromtimestamp(tx.block_time, tz=timezone.utc).isoformat()
+
+        cj = detect_coinjoin(tx)
 
         return ChainTxDetailsResponse(
             txid=txid,
@@ -628,7 +708,8 @@ async def get_chain_tx(
             outputs=outputs_summary,
             has_op_return=tx.has_op_return,
             op_return_data=tx.op_return_data,
-            burned_value_btc=tx.burned_value_sat / 1e8
+            burned_value_btc=tx.burned_value_sat / 1e8,
+            coinjoin=cj,
         )
     except NotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -652,6 +733,12 @@ async def get_chain_tx_edges(
 
         # Fetch transaction
         tx = await source.get_transaction(txid)
+
+        # CoinJoin detection for this tx (cached)
+        from chain.coinjoin import detect_coinjoin
+        cj = detect_coinjoin(tx)
+        is_cj = cj.get("is_coinjoin", False)
+        cj_type = cj.get("type")
 
         # Convert to edges with focal address
         edge_data_list = transaction_to_edges(tx, focal_address=focal, include_change=False)
@@ -756,6 +843,8 @@ async def get_chain_tx_edges(
                 confirmed=edge_data.get("confirmed"),
                 is_change=edge_data.get("is_change"),
                 large_tx=edge_data.get("large_tx"),
+                is_coinjoin=is_cj,
+                coinjoin_type=cj_type,
             ))
 
         return {
@@ -773,6 +862,172 @@ async def get_chain_tx_edges(
         print(f"Chain tx edges error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ---------------------------------------------------------------------------
+# Mixing & sanctions endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/chain/address/{address}/mixing")
+async def get_chain_address_mixing(
+    address: str,
+    source: EsploraSource = Depends(require_chain_source),
+):
+    """
+    Compute wallet-level CoinJoin exposure and OFAC sanctions summary.
+    Loads at most 2 pages (≈ 50 txs) of address history and fetches
+    at most 20 parent transactions to check post-mix funding.
+    """
+    from chain.coinjoin import detect_coinjoin
+    from chain.exceptions import NotFound as _NotFound, ChainUnavailable as _Unavail
+    import asyncio as _asyncio
+
+    t0 = time.time()
+    try:
+        source.validate_address(address)
+    except InvalidAddress as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # ---- fetch up to 2 pages of address history ----
+    try:
+        txs_p1, cursor1, has_more1 = await source.get_address_txs_page(address, None, 25)
+    except (_NotFound, _Unavail) as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    txs = list(txs_p1)
+    truncated = False
+
+    if has_more1 and cursor1:
+        try:
+            txs_p2, _cur2, _more2 = await source.get_address_txs_page(address, cursor1, 25)
+            txs.extend(txs_p2)
+            if _more2:
+                truncated = True
+        except Exception:
+            truncated = True  # partial result
+
+    # ---- analyse own transactions ----
+    cj_participations = 0
+    cj_types: dict = {}
+    sent_to_coinjoin = 0
+    # collect parent txids needed for received_from_coinjoin and consolidations
+    # parent_need[parent_txid] = set of "use" tags ("post_mix" | "consolidation")
+    parent_need: dict = {}
+
+    for tx in txs:
+        cj = detect_coinjoin(tx)
+        if not cj["is_coinjoin"]:
+            continue
+        cj_type = cj["type"]
+        is_input = any(i.address == address for i in tx.inputs if i.address)
+        is_output = any(o.address == address for o in tx.outputs if o.address)
+        if is_input or is_output:
+            cj_participations += 1
+            cj_types[cj_type] = cj_types.get(cj_type, 0) + 1
+        if is_input:
+            sent_to_coinjoin += 1
+
+    # For post-mix and consolidation checks we need parent txs.
+    # Identify inputs to this address's txs where the address is an OUTPUT
+    # (to check if the payer was in a CoinJoin — post-mix).
+    for tx in txs:
+        is_output = any(o.address == address for o in tx.outputs if o.address)
+        if is_output:
+            for inp in tx.inputs:
+                if inp.txid and not inp.is_coinbase:
+                    parent_need.setdefault(inp.txid, set()).add("post_mix")
+
+        # For consolidation: txs where address is an INPUT
+        is_input = any(i.address == address for i in tx.inputs if i.address)
+        if is_input:
+            addr_inputs = [i for i in tx.inputs if i.address == address and i.txid]
+            if len(addr_inputs) >= 2:
+                for inp in addr_inputs:
+                    if inp.txid:
+                        parent_need.setdefault(inp.txid, set()).add("consolidation")
+
+    # Fetch up to 20 parents
+    MAX_PARENTS = 20
+    parent_txids = list(parent_need.keys())[:MAX_PARENTS]
+    if len(parent_need) > MAX_PARENTS:
+        truncated = True
+
+    parent_cj: dict = {}  # txid -> bool (is CoinJoin)
+
+    async def _fetch_parent(ptxid: str):
+        try:
+            ptx = await source.get_transaction(ptxid)
+            cj = detect_coinjoin(ptx)
+            return ptxid, cj["is_coinjoin"]
+        except Exception:
+            return ptxid, None  # failed fetch treated as unknown
+
+    results = await _asyncio.gather(*[_fetch_parent(p) for p in parent_txids])
+    for ptxid, is_cj in results:
+        parent_cj[ptxid] = is_cj
+
+    # ---- post-mix received ----
+    received_from_coinjoin = 0
+    seen_post_mix_txs: set = set()
+    for tx in txs:
+        is_output = any(o.address == address for o in tx.outputs if o.address)
+        if not is_output:
+            continue
+        funded_by_cj = any(
+            parent_cj.get(i.txid) is True
+            for i in tx.inputs
+            if i.txid and not i.is_coinbase and "post_mix" in parent_need.get(i.txid, set())
+        )
+        if funded_by_cj and tx.txid not in seen_post_mix_txs:
+            received_from_coinjoin += 1
+            seen_post_mix_txs.add(tx.txid)
+
+    # ---- consolidations ----
+    consolidations = 0
+    for tx in txs:
+        addr_inputs = [i for i in tx.inputs if i.address == address and i.txid]
+        if len(addr_inputs) < 2:
+            continue
+        cj_input_count = sum(
+            1 for i in addr_inputs
+            if parent_cj.get(i.txid) is True
+        )
+        if cj_input_count >= 2:
+            consolidations += 1
+
+    # ---- sanctions ----
+    all_counterparty_addrs: set = set()
+    for tx in txs:
+        for inp in tx.inputs:
+            if inp.address and inp.address != address:
+                all_counterparty_addrs.add(inp.address)
+        for out in tx.outputs:
+            if out.address and out.address != address:
+                all_counterparty_addrs.add(out.address)
+
+    self_check = _ofac_check([address])
+    cp_check = _ofac_check(list(all_counterparty_addrs))
+    sanctions = {
+        "available": _ofac_available,
+        "listed": bool(self_check.get("hits")),
+        "entity": self_check["hits"][0]["entity"] if self_check.get("hits") else None,
+        "counterparties_listed": cp_check.get("hits", []),
+    }
+
+    ms = round((time.time() - t0) * 1000)
+    return {
+        "cj_participations": cj_participations,
+        "cj_types": cj_types,
+        "received_from_coinjoin": received_from_coinjoin,
+        "consolidations": consolidations,
+        "sent_to_coinjoin": sent_to_coinjoin,
+        "checked_txs": len(txs),
+        "parents_checked": len(results),
+        "truncated": truncated,
+        "ms": ms,
+        "sanctions": sanctions,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn

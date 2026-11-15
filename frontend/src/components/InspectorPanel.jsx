@@ -1,7 +1,120 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import apiClient from '../api/client';
 import ModelRiskBlock, { TxRiskBadge } from './ModelRiskBlock';
 import FeatureChart from './FeatureChart';
+import { coinJoinLabel, isCoinJoin } from './riskUtils';
+
+// ---------------------------------------------------------------------------
+// Mixing & Sanctions Exposure block (chain mode only)
+// ---------------------------------------------------------------------------
+
+function MixingExposureBlock({ loading, error, data }) {
+  if (loading) {
+    return (
+      <div>
+        <div className="text-gray-400 text-sm mb-2">Mixing &amp; sanctions exposure</div>
+        <div className="text-gray-500 text-sm animate-pulse">Loading…</div>
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div>
+        <div className="text-gray-400 text-sm mb-2">Mixing &amp; sanctions exposure</div>
+        <div className="text-red-400 text-xs">{error}</div>
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const { sanctions, cj_participations, cj_types, received_from_coinjoin,
+          consolidations, sent_to_coinjoin, checked_txs, truncated } = data;
+  const hasCj = cj_participations > 0 || received_from_coinjoin > 0 ||
+                consolidations > 0 || sent_to_coinjoin > 0;
+
+  return (
+    <div className="space-y-3">
+      <div className="text-gray-400 text-sm">Mixing &amp; sanctions exposure</div>
+
+      {/* OFAC sanctions banner */}
+      {sanctions?.available && sanctions?.listed && (
+        <div className="p-3 rounded-lg bg-red-900/30 border border-red-700/50">
+          <div className="text-sm font-semibold text-red-300">
+            ⚠ OFAC sanctioned: {sanctions.entity || 'unknown entity'}
+          </div>
+        </div>
+      )}
+      {sanctions?.available && !sanctions?.listed &&
+        sanctions?.counterparties_listed?.length > 0 && (
+        <div className="p-2 rounded bg-orange-900/20 border border-orange-700/40">
+          <div className="text-xs font-medium text-orange-300 mb-1">
+            Sanctioned counterparties:
+          </div>
+          <ul className="space-y-1">
+            {sanctions.counterparties_listed.map((cp, i) => (
+              <li key={i} className="text-xs font-mono text-orange-200 truncate"
+                  title={cp.entity}>
+                {cp.address.slice(0, 20)}… — {cp.entity}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {!sanctions?.available && (
+        <div className="text-xs text-gray-500">
+          OFAC data unavailable — run scripts/update_ofac_btc.py to load.
+        </div>
+      )}
+
+      {/* CoinJoin stats */}
+      <div className="bg-surface-2 rounded-lg p-3 space-y-2 text-sm">
+        <div className="flex justify-between">
+          <span className="text-gray-400">CoinJoin participations</span>
+          <span className={cj_participations > 0 ? 'text-purple-300 font-medium' : 'text-gray-400'}>
+            {cj_participations}
+          </span>
+        </div>
+        {cj_participations > 0 && Object.keys(cj_types ?? {}).length > 0 && (
+          <div className="ml-3 space-y-1 text-xs text-gray-400">
+            {Object.entries(cj_types).map(([t, n]) => (
+              <div key={t} className="flex justify-between">
+                <span>{t}</span><span>{n}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="flex justify-between">
+          <span className="text-gray-400">Sent to CoinJoin (pre-mix)</span>
+          <span className={sent_to_coinjoin > 0 ? 'text-purple-300' : 'text-gray-400'}>
+            {sent_to_coinjoin}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-400">Received from CoinJoin (post-mix)</span>
+          <span className={received_from_coinjoin > 0 ? 'text-purple-300' : 'text-gray-400'}>
+            {received_from_coinjoin}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-gray-400">CoinJoin output consolidations</span>
+          <span className={consolidations > 0 ? 'text-purple-300' : 'text-gray-400'}>
+            {consolidations}
+          </span>
+        </div>
+        <div className="text-xs text-gray-500 pt-1 border-t border-surface-3">
+          Checked {checked_txs} transaction{checked_txs !== 1 ? 's' : ''}
+          {truncated && ' (partial — full history not loaded)'}
+        </div>
+      </div>
+
+      <div className="text-xs text-gray-500 leading-relaxed">
+        CoinJoin is a privacy technique, not proof of illicit activity.
+        Shown as a risk factor only.
+      </div>
+    </div>
+  );
+}
+
 
 function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTransaction, onSwitchToLiveChain }) {
   const [details, setDetails] = useState(null);
@@ -13,6 +126,10 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
   const [loadingTx, setLoadingTx] = useState({});  // Track loading state per txid
   const [onGraphTxs, setOnGraphTxs] = useState(new Set());  // Track which txs are on graph
   const [txNotes, setTxNotes] = useState({});  // per-tx message: "No counterparties" / error
+  const [mixingData, setMixingData] = useState(null);
+  const [mixingLoading, setMixingLoading] = useState(false);
+  const [mixingError, setMixingError] = useState(null);
+  const mixingCache = useRef(new Map());
 
   const handleDelete = () => {
     if (!selectedNode) return;
@@ -110,6 +227,36 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
 
     loadDetails();
   }, [selectedNode]);
+
+  // Lazy-load mixing & sanctions exposure for chain wallets
+  useEffect(() => {
+    if (!details || details.type !== 'wallet' || details.data_source !== 'chain') {
+      setMixingData(null);
+      setMixingError(null);
+      setMixingLoading(false);
+      return;
+    }
+    const address = details.address;
+    if (!address) return;
+    if (mixingCache.current.has(address)) {
+      setMixingData(mixingCache.current.get(address));
+      setMixingError(null);
+      setMixingLoading(false);
+      return;
+    }
+    setMixingLoading(true);
+    setMixingError(null);
+    setMixingData(null);
+    apiClient.getChainAddressMixing(address)
+      .then(data => {
+        mixingCache.current.set(address, data);
+        setMixingData(data);
+      })
+      .catch(err => {
+        setMixingError(err.message || 'Failed to load mixing data');
+      })
+      .finally(() => setMixingLoading(false));
+  }, [details?.address, details?.data_source, details?.type]);
 
   const handleTransactionClick = async (tx) => {
     if (tx.direction === 'self') {
@@ -405,6 +552,15 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                     }}
                   />
 
+                  {/* Mixing & sanctions exposure (Live Chain only) */}
+                  {details.data_source === 'chain' && (
+                    <MixingExposureBlock
+                      loading={mixingLoading}
+                      error={mixingError}
+                      data={mixingData}
+                    />
+                  )}
+
                   {/* Open in Live Chain button (Elliptic++ only) */}
                   {details.data_source === 'ellipticpp' && (
                     <button
@@ -479,12 +635,22 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                                   : tx.timestamp ? new Date(tx.timestamp).toLocaleDateString() : 'Pending'}
                               </span>
                               {details.data_source === 'chain' && (
-                                <span className={`text-xs px-2 py-0.5 rounded ${
-                                  tx.confirmed
-                                    ? 'bg-green-900/30 text-green-400'
-                                    : 'bg-yellow-900/30 text-yellow-400'
-                                }`}>
-                                  {tx.confirmed ? 'Confirmed' : 'Unconfirmed'}
+                                <span className="flex items-center gap-1">
+                                  {isCoinJoin(tx.coinjoin) && (
+                                    <span
+                                      className="text-xs px-2 py-0.5 rounded font-medium bg-purple-900/40 text-purple-300 border border-purple-700/50"
+                                      title={tx.coinjoin?.reasons?.join('\n') || 'CoinJoin detected'}
+                                    >
+                                      {coinJoinLabel(tx.coinjoin)}
+                                    </span>
+                                  )}
+                                  <span className={`text-xs px-2 py-0.5 rounded ${
+                                    tx.confirmed
+                                      ? 'bg-green-900/30 text-green-400'
+                                      : 'bg-yellow-900/30 text-yellow-400'
+                                  }`}>
+                                    {tx.confirmed ? 'Confirmed' : 'Unconfirmed'}
+                                  </span>
                                 </span>
                               )}
                               {details.data_source === 'ellipticpp' && (
@@ -601,6 +767,38 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                         <div className="flex items-center justify-between text-sm">
                           <span className="text-gray-400">Block {details.block_height.toLocaleString()}</span>
                           <span className="text-gray-400">{details.confirmations} confirmation{details.confirmations !== 1 ? 's' : ''}</span>
+                        </div>
+                      )}
+
+                      {/* CoinJoin badge */}
+                      {isCoinJoin(details.coinjoin) && (
+                        <div>
+                          <div className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-purple-900/30 border border-purple-700/50">
+                            <span className="text-purple-300 font-medium text-sm">
+                              CoinJoin · {coinJoinLabel(details.coinjoin)}
+                            </span>
+                            <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                              details.coinjoin.confidence === 'high'
+                                ? 'bg-purple-700/40 text-purple-200'
+                                : details.coinjoin.confidence === 'medium'
+                                ? 'bg-purple-800/40 text-purple-300'
+                                : 'bg-gray-700/40 text-gray-300'
+                            }`}>
+                              {details.coinjoin.confidence} confidence
+                            </span>
+                          </div>
+                          {details.coinjoin.reasons?.length > 0 && (
+                            <details className="mt-2">
+                              <summary className="text-xs text-gray-400 cursor-pointer hover:text-gray-300">
+                                Detection reasons ({details.coinjoin.reasons.length})
+                              </summary>
+                              <ul className="mt-1 space-y-1 text-xs text-gray-400 bg-surface-2 p-2 rounded">
+                                {details.coinjoin.reasons.map((r, i) => (
+                                  <li key={i} className="font-mono">• {r}</li>
+                                ))}
+                              </ul>
+                            </details>
+                          )}
                         </div>
                       )}
                     </div>

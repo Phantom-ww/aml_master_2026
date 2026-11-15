@@ -49,6 +49,9 @@ class GraphEdge(BaseModel):
     large_tx: Optional[bool] = None
     tx_class: Optional[int] = None  # Elliptic++ transaction class
     tx_risk: Optional[float] = None  # Transaction risk from model (0-1)
+    # CoinJoin detection
+    is_coinjoin: Optional[bool] = None
+    coinjoin_type: Optional[str] = None  # e.g. "whirlpool", "wasabi2", …
 
 class SubgraphResponse(BaseModel):
     nodes: List[GraphNode]
@@ -58,6 +61,7 @@ class SubgraphResponse(BaseModel):
     source: Literal["ellipticpp", "chain"] = "ellipticpp"  # data source
     legacy: bool = False  # True for old investigations containing demo data
     model: Optional[Dict] = None  # Model scoring block (xgb/gnn), when available
+    sanctions: Optional[Dict] = None  # OFAC sanctions info for chain wallet
 
 class FeatureContribution(BaseModel):
     feature_name: str
@@ -73,6 +77,7 @@ class TransactionSummary(BaseModel):
     block_height: Optional[int] = None
     is_self_send: bool = False
     direction: Literal["in", "out", "self"]
+    coinjoin: Optional[Dict] = None  # CoinJoin detection result
 
 class NodeDetailsResponse(BaseModel):
     node_id: str
@@ -162,6 +167,9 @@ class ChainTxDetailsResponse(BaseModel):
     has_op_return: bool = False
     op_return_data: Optional[str] = None
     burned_value_btc: float = 0.0
+
+    # CoinJoin detection
+    coinjoin: Optional[Dict] = None
 
 # ============================================================================
 # INVESTIGATION SCHEMAS

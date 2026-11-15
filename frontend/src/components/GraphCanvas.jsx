@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { Graph } from '@antv/g6';
-import { labelColor, riskColor, LABEL_COLORS, RISK_COLORS } from './riskUtils';
+import { labelColor, riskColor, LABEL_COLORS, RISK_COLORS, MIXING_COLORS } from './riskUtils';
 
 function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNodeClick, isInvestigationMode, onGraphUpdate }) {
   const containerRef = useRef(null);
@@ -8,8 +8,19 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
   // G6 style callbacks are created once; read the current mode through a ref
   const colorModeRef = useRef(colorMode);
 
-  const nodeFill = (d) => (colorModeRef.current === 'model' ? riskColor(d?.model_risk) : labelColor(d || {}));
+  const nodeFill = (d) => {
+    if (colorModeRef.current === 'model') return riskColor(d?.model_risk);
+    if (colorModeRef.current === 'mixing') {
+      if (d?.is_ofac) return MIXING_COLORS.ofac_ring;
+      if (d?._is_cj_node) return MIXING_COLORS.cj_node;
+      return MIXING_COLORS.neutral_node;
+    }
+    return labelColor(d || {});
+  };
   const edgeStroke = (d) => {
+    if (colorModeRef.current === 'mixing') {
+      return d?.is_coinjoin ? MIXING_COLORS.cj_edge : MIXING_COLORS.neutral_edge;
+    }
     if (colorModeRef.current === 'model') {
       return d?.tx_risk != null ? riskColor(d.tx_risk) : '#4B5563';
     }
@@ -127,7 +138,22 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
     const nodes = graph.getNodeData();
     const edges = graph.getEdgeData();
     if (nodes.length === 0) return;
-    graph.updateNodeData(nodes.map(n => ({ id: n.id, data: { ...n.data, _colorMode: colorMode } })));
+
+    // For mixing mode: compute which nodes are involved in CoinJoin edges
+    let cjNodeIds = new Set();
+    if (colorMode === 'mixing' && edges.length > 0) {
+      edges.forEach(e => {
+        if (e.data?.is_coinjoin) {
+          cjNodeIds.add(e.source);
+          cjNodeIds.add(e.target);
+        }
+      });
+    }
+
+    graph.updateNodeData(nodes.map(n => ({
+      id: n.id,
+      data: { ...n.data, _colorMode: colorMode, _is_cj_node: cjNodeIds.has(n.id) },
+    })));
     if (edges.length > 0) {
       graph.updateEdgeData(edges.map(e => ({ id: e.id, data: { ...e.data, _colorMode: colorMode } })));
     }
@@ -220,6 +246,8 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
             data_source: edge.data_source,
             tx_class: edge.tx_class,
             tx_risk: edge.tx_risk ?? edge.tx_model?.prob ?? null,
+            is_coinjoin: edge.is_coinjoin ?? false,
+            coinjoin_type: edge.coinjoin_type ?? null,
           },
           style: {
             lineWidth: 2,
@@ -323,6 +351,8 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
           data_source: edge.data_source,
           tx_class: edge.tx_class,
           tx_risk: edge.tx_risk ?? edge.tx_model?.prob ?? null,
+          is_coinjoin: edge.is_coinjoin ?? false,
+          coinjoin_type: edge.coinjoin_type ?? null,
         },
         style: {
           lineWidth: 2,
@@ -480,6 +510,8 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
             data_source: edge.data_source,
             tx_class: edge.tx_class,
             tx_risk: edge.tx_risk ?? edge.tx_model?.prob ?? null,
+            is_coinjoin: edge.is_coinjoin ?? false,
+            coinjoin_type: edge.coinjoin_type ?? null,
           },
           style: {
             lineWidth: 2,
@@ -552,7 +584,7 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
       {/* Color mode toggle */}
       <div className="absolute top-4 left-4 flex bg-surface-2 border border-surface-3 rounded-lg overflow-hidden shadow-lg text-xs">
         <span className="px-3 py-1.5 text-gray-400">Color by</span>
-        {[['label', 'Known label'], ['model', 'Model risk']].map(([mode, title]) => (
+        {[['label', 'Known label'], ['model', 'Model risk'], ['mixing', 'Mixing']].map(([mode, title]) => (
           <button
             key={mode}
             onClick={() => onColorModeChange?.(mode)}
@@ -568,7 +600,24 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
       {/* Legend */}
       <div className="absolute bottom-4 right-4 bg-surface-2 border border-surface-3 rounded-lg p-3 shadow-lg">
         <div className="space-y-2 text-sm">
-          {(colorMode === 'model'
+          {colorMode === 'mixing' ? (
+            <>
+              {[
+                [MIXING_COLORS.cj_edge, 'CoinJoin edge'],
+                [MIXING_COLORS.cj_node, 'CoinJoin node'],
+                [MIXING_COLORS.ofac_ring, 'OFAC sanctioned'],
+                [MIXING_COLORS.neutral_node, 'No mixing detected'],
+              ].map(([color, text]) => (
+                <div key={text} className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}></div>
+                  <span className="text-gray-300">{text}</span>
+                </div>
+              ))}
+              <div className="text-xs text-gray-500 mt-2 pt-2 border-t border-surface-3 max-w-[14rem]">
+                CoinJoin detection from loaded transaction data (Live Chain only)
+              </div>
+            </>
+          ) : (colorMode === 'model'
             ? [[RISK_COLORS.critical, '≥ 80%'], [RISK_COLORS.high, '50–80%'], [RISK_COLORS.medium, '20–50%'],
                [RISK_COLORS.low, '< 20%'], [RISK_COLORS.none, 'Not scored']]
             : [[LABEL_COLORS.illicit, 'Illicit'], [LABEL_COLORS.licit, 'Licit'], [LABEL_COLORS.unknown, 'Unknown']]
@@ -578,11 +627,13 @@ function GraphCanvas({ graphData, colorMode = 'label', onColorModeChange, onNode
               <span className="text-gray-300">{text}</span>
             </div>
           ))}
-          <div className="text-xs text-gray-500 mt-2 pt-2 border-t border-surface-3 max-w-[14rem]">
-            {colorMode === 'model'
-              ? 'Fraud probability: wallets — GraphSAGE, edges — transaction model'
-              : 'Labels: Elliptic++ (historical)'}
-          </div>
+          {colorMode !== 'mixing' && (
+            <div className="text-xs text-gray-500 mt-2 pt-2 border-t border-surface-3 max-w-[14rem]">
+              {colorMode === 'model'
+                ? 'Fraud probability: wallets — GraphSAGE, edges — transaction model'
+                : 'Labels: Elliptic++ (historical)'}
+            </div>
+          )}
         </div>
       </div>
     </div>

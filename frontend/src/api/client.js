@@ -91,6 +91,10 @@ class APIClient {
     return this.get(`/api/chain/tx/${txid}/edges?focal=${focalAddress}&max=${max}`);
   }
 
+  async getChainAddressMixing(address) {
+    return this.get(`/api/chain/address/${address}/mixing`);
+  }
+
   // Investigation endpoints
   async listInvestigations(analystId = 'default') {
     return this.get(`/api/investigations?analyst_id=${analystId}`);
