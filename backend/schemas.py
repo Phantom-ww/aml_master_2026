@@ -78,6 +78,7 @@ class TransactionSummary(BaseModel):
     is_self_send: bool = False
     direction: Literal["in", "out", "self"]
     coinjoin: Optional[Dict] = None  # CoinJoin detection result
+    live_tx_model: Optional[Dict] = None  # Live tx risk model summary (experimental)
 
 class NodeDetailsResponse(BaseModel):
     node_id: str
@@ -170,6 +171,9 @@ class ChainTxDetailsResponse(BaseModel):
 
     # CoinJoin detection
     coinjoin: Optional[Dict] = None
+
+    # Live tx model (experimental) — full detail including explanations/ood
+    live_tx_model: Optional[Dict] = None
 
 # ============================================================================
 # INVESTIGATION SCHEMAS

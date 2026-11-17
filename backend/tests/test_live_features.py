@@ -80,3 +80,28 @@ def test_derive_dataframe_equals_dict():
     for i, (_, r) in enumerate(w.iterrows()):
         one = derive_live_features(r.to_dict())
         assert np.allclose([one[k] for k in LIVE_FEATURES], vec.iloc[i][LIVE_FEATURES].values)
+
+
+from chain.live_features import tx_live_features_from_esplora, LIVE_TX_FEATURES, TX_CONTEXT_FEATURES
+
+
+def test_tx_features_match_authors_example():
+    """Elliptic++ example tx 272145560: 1 input 2.7732 BTC -> outputs 0.001917 + 2.770883, fee 0.0004."""
+    tx = _tx("x", [("I", 277_320_000)], [("O1", 191_700), ("O2", 277_088_300)], 40_000)
+    tx["size"] = 226
+    f, b = tx_live_features_from_esplora(tx)
+    assert np.isclose(b["in_BTC_total"], 2.7732) and np.isclose(b["out_BTC_total"], 2.7728)
+    assert np.isclose(b["out_BTC_mean"], 1.3864) and np.isclose(b["out_BTC_min"], 0.001917)
+    assert np.isclose(b["in_BTC_total"] - b["out_BTC_total"], b["fees"])
+    assert list(f) == LIVE_TX_FEATURES + TX_CONTEXT_FEATURES
+    assert np.isclose(f["share_largest_input"], 1.0, atol=1e-6) and f["num_output_addresses"] == 2
+    assert np.isclose(f["fee_rate_sat_b"], 40_000 / 226)
+
+
+def test_tx_features_coinbase_and_op_return():
+    tx = {"txid": "cb", "fee": 0, "size": 200, "status": {"block_height": 1},
+          "vin": [{"is_coinbase": True}],
+          "vout": [{"scriptpubkey_address": "M", "value": 312_500_000}, {"scriptpubkey_type": "op_return", "value": 0}]}
+    f, b = tx_live_features_from_esplora(tx)
+    assert b["num_output_addresses"] == 1 and b["num_input_addresses"] == 0
+    assert all(np.isfinite(v) for v in f.values())

@@ -109,10 +109,11 @@ async def lifespan(app: FastAPI):
     from services.live_model import get_service as get_live_model_service
     live_svc = get_live_model_service()
     live_svc.load(settings.live_model_dir)
-    if live_svc.is_ready:
-        print(f"Live model service ready: {live_svc.model_version}")
-    else:
-        print(f"Live model not ready: {live_svc.load_error}")
+    for _bname in ("wallet", "tx"):
+        if live_svc.is_bundle_ready(_bname):
+            print(f"Live {_bname} model ready: {live_svc.get_model_version(_bname)}")
+        else:
+            print(f"Live {_bname} model not ready: {live_svc._bundles[_bname].load_error}")
 
     # Initialize chain services if enabled
     if settings.chain_enabled:
@@ -398,6 +399,17 @@ async def get_chain_subgraph(
                             "coinjoin_type": cj_type,
                         })
 
+        # Batch-score all txs; inject tx_risk on edges
+        from chain.tx_scorer import score_txs_batch as _score_txs
+        tx_scores = _score_txs(list(subgraph.transactions.values()))
+        for edge in edges:
+            score = tx_scores.get(edge.get("tx_address") if isinstance(edge, dict) else edge["tx_address"])
+            if score:
+                if isinstance(edge, dict):
+                    edge["tx_risk"] = score.get("prob")
+                else:
+                    edge.tx_risk = score.get("prob")
+
         return SubgraphResponse(
             nodes=nodes,
             edges=edges,
@@ -620,9 +632,15 @@ async def get_chain_address(
 
         # Calculate next_cursor: last confirmed transaction's txid, or None
         next_cursor = None
-        confirmed_txs = [tx for tx in addr_data.txs if tx.block_height is not None]
-        if confirmed_txs and len(addr_data.txs) >= 25:  # Esplora page size
-            next_cursor = confirmed_txs[-1].txid
+        confirmed_txs_list = [t for t in addr_data.txs if t.block_height is not None]
+        if confirmed_txs_list and len(addr_data.txs) >= 25:  # Esplora page size
+            next_cursor = confirmed_txs_list[-1].txid
+
+        # Batch-score all txs with the live tx model; inject live_tx_model into each entry
+        from chain.tx_scorer import score_txs_batch as _score_txs
+        tx_scores = _score_txs(addr_data.txs)
+        for t in transactions:
+            t["live_tx_model"] = tx_scores.get(t["txid"])
 
         ellipticpp_class = get_ellipticpp_label(address)
 
@@ -709,6 +727,13 @@ async def get_chain_address_txs_page(
                 coinjoin=cj,
             ))
 
+        # Batch-score with live tx model
+        from chain.tx_scorer import score_txs_batch as _score_txs
+        tx_scores = _score_txs(txs)
+        # Re-build TransactionSummary list with live_tx_model injected
+        for i, t in enumerate(transactions):
+            transactions[i] = t.model_copy(update={"live_tx_model": tx_scores.get(t.txid)})
+
         return TransactionPageResponse(
             transactions=transactions,
             next_cursor=next_cursor,
@@ -775,6 +800,10 @@ async def get_chain_tx(
 
         cj = detect_coinjoin(tx)
 
+        # Live tx model scoring (experimental)
+        from chain.tx_scorer import score_txs_batch as _score_txs
+        tx_scores = _score_txs([tx], full_detail_txid=txid)
+
         return ChainTxDetailsResponse(
             txid=txid,
             confirmed=tx.confirmations > 0,
@@ -793,6 +822,7 @@ async def get_chain_tx(
             op_return_data=tx.op_return_data,
             burned_value_btc=tx.burned_value_sat / 1e8,
             coinjoin=cj,
+            live_tx_model=tx_scores.get(txid),
         )
     except NotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -822,6 +852,10 @@ async def get_chain_tx_edges(
         cj = detect_coinjoin(tx)
         is_cj = cj.get("is_coinjoin", False)
         cj_type = cj.get("type")
+
+        # Live tx model score for this tx (cached by txid)
+        from chain.tx_scorer import score_txs_batch as _score_txs
+        tx_score = _score_txs([tx]).get(txid)
 
         # Convert to edges with focal address
         edge_data_list = transaction_to_edges(tx, focal_address=focal, include_change=False)
@@ -928,6 +962,7 @@ async def get_chain_tx_edges(
                 large_tx=edge_data.get("large_tx"),
                 is_coinjoin=is_cj,
                 coinjoin_type=cj_type,
+                tx_risk=tx_score.get("prob") if tx_score else None,
             ))
 
         return {

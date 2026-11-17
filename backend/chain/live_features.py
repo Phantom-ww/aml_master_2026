@@ -232,3 +232,118 @@ def live_features_from_txs(address: str, txs: list[dict]) -> tuple[dict, dict]:
     base = base_stats_from_txs(address, txs)
     feats = {k: float(v) for k, v in derive_live_features(base).items()}
     return feats, base
+
+
+# =========================================================================================
+# Transaction model for Live Chain mode
+# =========================================================================================
+# Elliptic++ "augmented" tx features are raw values (BTC, bytes, counts) -- checked on the
+# authors' example tx: in_BTC_total - out_BTC_total == fees, out_BTC_mean == out_BTC_total / n_outputs.
+# The other 165 tx features are anonymised and cannot be computed for live transactions.
+# in_txs_degree / out_txs_degree count neighbours INSIDE the dataset, so they are not used.
+
+TX_AUGMENTED = ["in_txs_degree", "out_txs_degree", "total_BTC", "fees", "size",
+                "num_input_addresses", "num_output_addresses",
+                "in_BTC_min", "in_BTC_max", "in_BTC_mean", "in_BTC_median", "in_BTC_total",
+                "out_BTC_min", "out_BTC_max", "out_BTC_mean", "out_BTC_median", "out_BTC_total"]
+
+# Scale-free, computable from one Esplora tx, no dataset-dependent counts.
+LIVE_TX_FEATURES = [
+    "num_input_addresses", "num_output_addresses", "ratio_outputs_inputs",
+    "rel_fee_bps",
+    "share_largest_input", "share_largest_output", "share_smallest_output",
+    "ratio_in_max_min", "ratio_in_mean_median", "ratio_out_max_min", "ratio_out_mean_median",
+]
+# Context (not model inputs): OOD check and drift report. fee rate and size per I/O drift with
+# the fee market and SegWit/Taproot adoption.
+TX_CONTEXT_FEATURES = ["fee_rate_sat_b", "bytes_per_io", "total_BTC"]
+
+LIVE_TX_FEATURE_LABELS = {
+    "num_input_addresses": "Input addresses",
+    "num_output_addresses": "Output addresses",
+    "ratio_outputs_inputs": "Outputs / inputs (log)",
+    "rel_fee_bps": "Fee share of input value (log bps)",
+    "share_largest_input": "Largest input share",
+    "share_largest_output": "Largest output share",
+    "share_smallest_output": "Smallest output share",
+    "ratio_in_max_min": "Largest / smallest input (log)",
+    "ratio_in_mean_median": "Mean / median input (log)",
+    "ratio_out_max_min": "Largest / smallest output (log)",
+    "ratio_out_mean_median": "Mean / median output (log)",
+    "fee_rate_sat_b": "Fee rate (sat/byte)",
+    "bytes_per_io": "Bytes per input+output",
+    "total_BTC": "Total BTC",
+}
+
+LIVE_TX_FEATURE_FORMULAS = {
+    "num_input_addresses": "distinct input addresses",
+    "num_output_addresses": "distinct output addresses",
+    "ratio_outputs_inputs": "log1p(num_output_addresses / max(num_input_addresses, 1))",
+    "rel_fee_bps": "log1p(1e4 * fees / (in_BTC_total + eps))",
+    "share_largest_input": "in_BTC_max / (in_BTC_total + eps)",
+    "share_largest_output": "out_BTC_max / (out_BTC_total + eps)",
+    "share_smallest_output": "out_BTC_min / (out_BTC_total + eps)",
+    "ratio_in_max_min": "log1p(in_BTC_max / (in_BTC_min + eps))",
+    "ratio_in_mean_median": "log1p(in_BTC_mean / (in_BTC_median + eps))",
+    "ratio_out_max_min": "log1p(out_BTC_max / (out_BTC_min + eps))",
+    "ratio_out_mean_median": "log1p(out_BTC_mean / (out_BTC_median + eps))",
+}
+
+
+def derive_tx_live_features(b):
+    """Scale-free tx features (+ context) from Elliptic++ augmented features; DataFrame or dict."""
+    g = lambda k: b[k]
+    n_in = np.maximum(g("num_input_addresses"), 1)
+    out = {
+        "num_input_addresses": g("num_input_addresses"),
+        "num_output_addresses": g("num_output_addresses"),
+        "ratio_outputs_inputs": _L(g("num_output_addresses") / n_in),
+        "rel_fee_bps": _L(1e4 * g("fees") / (g("in_BTC_total") + EPS)),
+        "share_largest_input": g("in_BTC_max") / (g("in_BTC_total") + EPS),
+        "share_largest_output": g("out_BTC_max") / (g("out_BTC_total") + EPS),
+        "share_smallest_output": g("out_BTC_min") / (g("out_BTC_total") + EPS),
+        "ratio_in_max_min": _L(g("in_BTC_max") / (g("in_BTC_min") + EPS)),
+        "ratio_in_mean_median": _L(g("in_BTC_mean") / (g("in_BTC_median") + EPS)),
+        "ratio_out_max_min": _L(g("out_BTC_max") / (g("out_BTC_min") + EPS)),
+        "ratio_out_mean_median": _L(g("out_BTC_mean") / (g("out_BTC_median") + EPS)),
+        # context
+        "fee_rate_sat_b": g("fees") * SATS / np.maximum(g("size"), 1),
+        "bytes_per_io": g("size") / np.maximum(g("num_input_addresses") + g("num_output_addresses"), 1),
+        "total_BTC": g("total_BTC"),
+    }
+    return {k: out[k] for k in LIVE_TX_FEATURES + TX_CONTEXT_FEATURES}
+
+
+def tx_base_from_esplora(tx: dict) -> dict:
+    """Elliptic++ augmented tx features from one Esplora tx (amounts per ADDRESS, in BTC)."""
+    ins: dict[str, float] = {}
+    for v in tx.get("vin", []):
+        if v.get("is_coinbase"):
+            continue
+        p = v.get("prevout") or {}
+        a = p.get("scriptpubkey_address") or f"_script_{len(ins)}"
+        ins[a] = ins.get(a, 0.0) + p.get("value", 0) / SATS
+    outs: dict[str, float] = {}
+    for o in tx.get("vout", []):
+        if o.get("scriptpubkey_type") == "op_return":
+            continue
+        a = o.get("scriptpubkey_address") or f"_script_{len(outs)}"
+        outs[a] = outs.get(a, 0.0) + o.get("value", 0) / SATS
+    fee = tx.get("fee", 0) / SATS
+    b = {"in_txs_degree": float(len({v.get("txid") for v in tx.get("vin", []) if not v.get("is_coinbase")})),
+         "out_txs_degree": 0.0,                     # needs /outspends; not used by the model
+         "fees": fee, "size": float(tx.get("size", 0)),
+         "num_input_addresses": float(len(ins)), "num_output_addresses": float(len(outs))}
+    for side, d in (("in", ins), ("out", outs)):
+        v = np.asarray(list(d.values()) or [0.0])
+        b.update({f"{side}_BTC_min": float(v.min()), f"{side}_BTC_max": float(v.max()),
+                  f"{side}_BTC_mean": float(v.mean()), f"{side}_BTC_median": float(np.median(v)),
+                  f"{side}_BTC_total": float(v.sum())})
+    b["total_BTC"] = b["out_BTC_total"]
+    return b
+
+
+def tx_live_features_from_esplora(tx: dict) -> tuple[dict, dict]:
+    base = tx_base_from_esplora(tx)
+    feats = {k: float(v) for k, v in derive_tx_live_features(base).items()}
+    return feats, base

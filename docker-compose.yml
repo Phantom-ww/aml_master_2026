@@ -34,6 +34,8 @@ services:
       HTTP_TIMEOUT: 120
       MAX_RETRIES: 5
       MAX_CONCURRENT_REQUESTS: 2
+      LIVE_FEATURE_MODE: full
+      LIVE_MAX_TXS: 100
     volumes:
       - ./backend:/app
       - ./data:/app/data

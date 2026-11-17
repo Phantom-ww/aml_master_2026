@@ -367,6 +367,160 @@ def main() -> None:
     n_neg = sum(1 for r in rows if str(r.get("y")) == "0")
     log.info("Done. labels.csv: %d total (%d pos, %d neg) → %s", len(rows), n_pos, n_neg, labels_path)
 
+    # --- Step 5: Collect transaction-level labels for the live tx model ---
+    log.info("=== Collecting transaction labels ===")
+    try:
+        collect_tx_labels(
+            ofac_set=ofac_set,
+            raw_dir=raw_dir,
+            tx_raw_dir=project_root / "data" / "live_eval" / "raw_tx",
+            tx_labels_path=project_root / "data" / "live_eval" / "tx_labels.csv",
+            esplora_url=args.esplora_url,
+            throttle=args.throttle,
+            limit=args.limit,
+            height_range=(min(heights), max(heights)),
+        )
+    except KeyboardInterrupt:
+        log.info("Interrupted during tx label collection — saving progress...")
+    except Exception as e:
+        log.warning("Tx label collection failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Transaction-level label collection (for the live tx model)
+# ---------------------------------------------------------------------------
+
+def _tx_raw_path(txid: str, tx_raw_dir: Path) -> Path:
+    return tx_raw_dir / f"{txid}.json.gz"
+
+
+def _load_tx_raw(txid: str, tx_raw_dir: Path) -> dict | None:
+    p = _tx_raw_path(txid, tx_raw_dir)
+    if p.exists():
+        with gzip.open(p, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def _save_tx_raw(txid: str, tx: dict, tx_raw_dir: Path) -> None:
+    tx_raw_dir.mkdir(parents=True, exist_ok=True)
+    with gzip.open(_tx_raw_path(txid, tx_raw_dir), "wt", encoding="utf-8") as f:
+        json.dump(tx, f)
+
+
+def _fetch_tx_raw(txid: str, esplora_url: str, throttle: float) -> dict | None:
+    return _get_json(f"{esplora_url}/tx/{txid}", throttle=throttle)
+
+
+def collect_tx_labels(
+    ofac_set: set[str],
+    raw_dir: Path,
+    tx_raw_dir: Path,
+    tx_labels_path: Path,
+    esplora_url: str,
+    throttle: float,
+    limit: int | None,
+    height_range: tuple[int, int],
+) -> None:
+    """Collect tx_labels.csv for the live tx model.
+
+    Positives: txs where an OFAC-listed address is an INPUT (spends sanctioned funds).
+    Negatives: random non-coinbase txs from random blocks in height_range.
+
+    Raw tx dicts are cached under data/live_eval/raw_tx/{txid}.json.gz.
+    """
+    # Resume from existing tx_labels.csv
+    existing: dict[str, dict] = {}
+    if tx_labels_path.exists():
+        with tx_labels_path.open(newline="", encoding="utf-8") as f:
+            existing = {r["txid"]: r for r in csv.DictReader(f)}
+
+    rows: list[dict] = list(existing.values())
+    done_txids = {r["txid"] for r in rows}
+
+    # ---- Positives: scan cached OFAC address histories for txs where the
+    #      OFAC address appears in vin (is an input / spends sanctioned funds) ----
+    pos_rows: list[dict] = []
+    for addr in sorted(ofac_set):
+        if limit and len(pos_rows) >= limit:
+            break
+        cached = load_cached(addr, raw_dir)
+        if not cached:
+            continue
+        for tx in cached:
+            txid = tx.get("txid")
+            if not txid or txid in done_txids:
+                continue
+            # Is the OFAC address an input? (is it in vin[].prevout.scriptpubkey_address?)
+            in_inputs = any(
+                (v.get("prevout") or {}).get("scriptpubkey_address") == addr
+                for v in tx.get("vin", [])
+                if not v.get("is_coinbase")
+            )
+            if not in_inputs:
+                continue
+            # Cache the raw tx dict (the address-txs payload already has vin/vout)
+            _save_tx_raw(txid, tx, tx_raw_dir)
+            rec = {"txid": txid, "y": 1, "source": "ofac_input", "address": addr, "raw_path": str(_tx_raw_path(txid, tx_raw_dir))}
+            pos_rows.append(rec)
+            rows.append(rec)
+            done_txids.add(txid)
+            if limit and len(pos_rows) >= limit:
+                break
+
+    n_pos = len(pos_rows)
+    log.info("  tx positives: %d", n_pos)
+
+    # ---- Negatives: random non-coinbase txs from random blocks in height_range ----
+    n_neg_needed = n_pos * 3
+    if limit:
+        n_neg_needed = min(n_neg_needed, max(0, limit - n_pos))
+    neg_rows: list[dict] = []
+    lo, hi = height_range
+    attempts = 0
+    max_attempts = n_neg_needed * 10
+
+    while len(neg_rows) < n_neg_needed and attempts < max_attempts:
+        attempts += 1
+        height = random.randint(lo, hi)
+        block_hash = _get_json(f"{esplora_url}/block-height/{height}", throttle=throttle)
+        if not isinstance(block_hash, str):
+            continue
+        txids = _get_json(f"{esplora_url}/block/{block_hash}/txids", throttle=throttle)
+        if not txids:
+            continue
+        candidates = txids[1:]  # skip coinbase (first tx)
+        random.shuffle(candidates)
+        for txid in candidates[:5]:
+            if txid in done_txids:
+                continue
+            raw = _load_tx_raw(txid, tx_raw_dir) or _fetch_tx_raw(txid, esplora_url, throttle)
+            if not raw:
+                continue
+            # Skip coinbase / op_return-only txs
+            if any(v.get("is_coinbase") for v in raw.get("vin", [])):
+                continue
+            _save_tx_raw(txid, raw, tx_raw_dir)
+            rec = {"txid": txid, "y": 0, "source": "block_sample", "address": "", "raw_path": str(_tx_raw_path(txid, tx_raw_dir))}
+            neg_rows.append(rec)
+            rows.append(rec)
+            done_txids.add(txid)
+            log.info("  tx negative %d/%d: %s", len(neg_rows), n_neg_needed, txid)
+            if len(neg_rows) >= n_neg_needed:
+                break
+
+    log.info("  tx negatives: %d", len(neg_rows))
+
+    # Write tx_labels.csv
+    tx_labels_path.parent.mkdir(parents=True, exist_ok=True)
+    with tx_labels_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["txid", "y", "source", "address", "raw_path"])
+        w.writeheader()
+        w.writerows(rows)
+    n_pos_total = sum(1 for r in rows if str(r.get("y")) == "1")
+    n_neg_total = sum(1 for r in rows if str(r.get("y")) == "0")
+    log.info("Done. tx_labels.csv: %d total (%d pos, %d neg) → %s", len(rows), n_pos_total, n_neg_total, tx_labels_path)
+
 
 if __name__ == "__main__":
     main()

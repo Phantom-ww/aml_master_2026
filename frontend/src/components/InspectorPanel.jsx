@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import apiClient from '../api/client';
-import ModelRiskBlock, { TxRiskBadge } from './ModelRiskBlock';
+import ModelRiskBlock, { TxRiskBadge, TxLiveModelBlock } from './ModelRiskBlock';
 import FeatureChart from './FeatureChart';
 import { coinJoinLabel, isCoinJoin } from './riskUtils';
 
@@ -644,6 +644,7 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                                       {coinJoinLabel(tx.coinjoin)}
                                     </span>
                                   )}
+                                  <TxRiskBadge txModel={tx.live_tx_model} compact />
                                   <span className={`text-xs px-2 py-0.5 rounded ${
                                     tx.confirmed
                                       ? 'bg-green-900/30 text-green-400'
@@ -906,7 +907,7 @@ function InspectorPanel({ selectedNode, onClose, onDelete, dataSource, onAddTran
                     {/* Risk Score */}
                     <div>
                       <h4 className="text-white font-semibold mb-2">Risk Assessment</h4>
-                      <div className="text-gray-500 text-sm">Not scored (chain data)</div>
+                      <TxLiveModelBlock txModel={details.live_tx_model} />
                     </div>
                   </>
                 ) : (

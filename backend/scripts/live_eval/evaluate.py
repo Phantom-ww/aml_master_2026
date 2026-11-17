@@ -538,6 +538,167 @@ def main() -> None:
     plot_pr(all_results, out_dir)
     print(f"Plots saved to {out_dir}")
 
+    # === Tx model evaluation ===
+    run_tx_evaluation(data_dir, model_dir, out_dir, args.n_bootstrap, args.recalibrate)
+
+
+# ---------------------------------------------------------------------------
+# Tx model evaluation
+# ---------------------------------------------------------------------------
+
+def run_tx_evaluation(
+    data_dir: Path,
+    model_dir: Path,
+    out_dir: Path,
+    n_bootstrap: int = 1000,
+    recalibrate_flag: bool = True,
+) -> None:
+    """Score the live tx model on tx_labels.csv and append a Transactions section to metrics.md."""
+    from chain.live_features import tx_live_features_from_esplora, LIVE_TX_FEATURES, TX_CONTEXT_FEATURES
+
+    tx_labels_path = data_dir / "tx_labels.csv"
+    if not tx_labels_path.exists():
+        print(f"\n[tx eval] tx_labels.csv not found at {tx_labels_path} — run collect.py first.")
+        return
+
+    tx_meta_path = model_dir / "live_tx_model_meta.json"
+    tx_model_path = model_dir / "xgb_live_tx_model.json"
+    if not tx_meta_path.exists() or not tx_model_path.exists():
+        print(f"\n[tx eval] Tx model files not found in {model_dir} — skipping tx evaluation.")
+        return
+
+    with open(tx_meta_path) as f:
+        tx_meta = json.load(f)
+
+    tx_booster = xgb.Booster()
+    tx_booster.load_model(str(tx_model_path))
+    best_iter = tx_meta.get("best_iteration", 0)
+    iter_range = (0, best_iter + 1) if best_iter else (0, 0)
+    threshold_raw = tx_meta["threshold_raw"]
+    cal = tx_meta["calibration"]
+    cal_x, cal_y = np.array(cal["x"]), np.array(cal["y"])
+    features_list = tx_meta["features"]
+    feature_labels = tx_meta.get("feature_labels", {})
+
+    tx_labels = pd.read_csv(tx_labels_path)
+    print(f"\n[tx eval] Loaded {len(tx_labels)} tx labels"
+          f" (pos={int((tx_labels['y']==1).sum())}, neg={int((tx_labels['y']==0).sum())})")
+
+    raws, probs, flags, oods, ys = [], [], [], [], []
+    missing = 0
+    for _, row in tx_labels.iterrows():
+        raw_path = row.get("raw_path", "")
+        if not raw_path or not Path(raw_path).exists():
+            missing += 1
+            continue
+        with gzip.open(raw_path, "rt", encoding="utf-8") as f:
+            tx = json.load(f)
+        try:
+            feats, _ = tx_live_features_from_esplora(tx)
+        except Exception as e:
+            warnings.warn(f"tx featurise error {row.get('txid')}: {e}")
+            continue
+
+        X = np.array([[float(feats.get(ft, 0.0) or 0.0) for ft in features_list]], dtype=np.float32)
+        dm = xgb.DMatrix(X, feature_names=features_list)
+        raw = float(tx_booster.predict(dm, iteration_range=iter_range)[0])
+        prob = _calibrate(raw, cal_x, cal_y)
+        flag = raw >= threshold_raw
+
+        # Compact OOD check using meta.ood_rule
+        rule = tx_meta.get("ood_rule", {})
+        ref = tx_meta.get("reference", {})
+        low_q, high_q = rule.get("low_q", "0.5"), rule.get("high_q", "99.5")
+        important = set(rule.get("important_features", []))
+        min_oor = rule.get("min_out_of_range", 3)
+        oor_count = 0
+        important_oor = False
+        for ft in features_list:
+            val = feats.get(ft)
+            if val is None:
+                continue
+            fr = ref.get(ft, {}).get("quantiles", {})
+            lo = fr.get(low_q)
+            hi = fr.get(high_q)
+            if lo is None or hi is None:
+                continue
+            if float(val) < lo or float(val) > hi:
+                oor_count += 1
+                if ft in important:
+                    important_oor = True
+        ood_flag = important_oor or oor_count >= min_oor
+
+        raws.append(raw)
+        probs.append(prob)
+        flags.append(flag)
+        oods.append(ood_flag)
+        ys.append(int(row["y"]))
+
+    if missing:
+        print(f"  [tx eval] {missing} txids skipped — raw file not found")
+
+    if not ys or len(np.unique(ys)) < 2:
+        print("  [tx eval] Insufficient data for metrics (need both classes)")
+        return
+
+    df_tx = pd.DataFrame({"y": ys, "tx_prob": probs, "tx_flag": flags, "tx_ood": oods, "tx_raw": raws})
+    tx_metrics = compute_metrics(df_tx, "tx_prob", "tx_flag", "tx_ood", n_bootstrap)
+
+    roc_str = f"{tx_metrics['roc_auc']:.3f}" if not np.isnan(tx_metrics.get("roc_auc", float("nan"))) else "n/a"
+    print(f"  [tx eval] ROC-AUC: {roc_str}  OOD%: {tx_metrics.get('ood_share', 0)*100:.1f}%")
+
+    # Platt recalibration
+    if recalibrate_flag and len(np.unique(ys)) > 1:
+        try:
+            df_tx["live_raw"] = raws  # recalibrate() reads "live_raw"
+            recal = recalibrate(df_tx, out_dir)
+            recal_path = model_dir / "live_tx_recalibration.json"
+            with open(recal_path, "w") as f:
+                json.dump(recal, f, indent=2)
+            print(f"  [tx eval] Tx recalibration saved to {recal_path} "
+                  f"(Brier before={recal['brier_before']:.4f}, after={recal['brier_after']:.4f})")
+        except Exception as e:
+            print(f"  [tx eval] Recalibration failed: {e}")
+
+    # Append "## Transactions" section to metrics.md
+    md_path = out_dir / "metrics.md"
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _fmt_auc_local(mean, lo, hi):
+        if np.isnan(mean):
+            return "n/a"
+        return f"{mean:.3f} ± {(hi-lo)/2:.3f} (95% CI [{lo:.3f}, {hi:.3f}])"
+
+    tx_md_lines = [
+        "",
+        "## Transactions",
+        "",
+        "Live transaction model (experimental). Positives = txs where an OFAC-listed address "
+        "is an input (spends sanctioned funds). Negatives = random non-coinbase txs from "
+        "sampled blocks in the same block-height range.",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| ROC-AUC | {_fmt_auc_local(tx_metrics['roc_auc'], tx_metrics['roc_auc_lo'], tx_metrics['roc_auc_hi'])} |",
+        f"| PR-AUC  | {_fmt_auc_local(tx_metrics['pr_auc'], tx_metrics['pr_auc_lo'], tx_metrics['pr_auc_hi'])} |",
+        f"| Precision | {tx_metrics['precision']:.3f} |",
+        f"| Recall    | {tx_metrics['recall']:.3f} |",
+        f"| F1        | {tx_metrics['f1']:.3f} |",
+        f"| Brier     | {tx_metrics['brier']:.4f} |",
+        f"| OOD share | {tx_metrics['ood_share']*100:.1f}% |",
+        f"| ROC-AUC (in-dist) | {tx_metrics.get('roc_auc_in_dist', float('nan')):.3f} |",
+        f"| N         | {tx_metrics['n']} |",
+        "",
+        "_Trained on Elliptic++ (2016–2017) using only interpretable features; "
+        "the original transaction model relies on anonymised features that cannot "
+        "be computed for live transactions._",
+    ]
+
+    # Append or create
+    with open(md_path, "a") as f:
+        f.write("\n".join(tx_md_lines) + "\n")
+    print(f"  [tx eval] Appended Transactions section to {md_path}")
+
 
 if __name__ == "__main__":
     main()

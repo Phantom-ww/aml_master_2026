@@ -387,11 +387,85 @@ export function TxRiskBadge({ txModel, compact = false }) {
     <span
       className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded font-medium"
       style={{ backgroundColor: `${color}26`, color, border: `1px solid ${color}66` }}
-      title="Transaction model: probability that the transaction is illicit"
+      title="Live transaction model (experimental)"
     >
       {compact ? 'Risk' : 'Fraud risk'} {formatProb(txModel.prob)}
       {txModel.flag && ' ⚑'}
+      {txModel.ood_flag && (
+        <span className="text-[10px] px-1 py-0.5 rounded bg-yellow-900/40 text-yellow-300 border border-yellow-700/50 ml-0.5">
+          OOD
+        </span>
+      )}
     </span>
+  );
+}
+
+/** Fraud risk block for a single Live Chain transaction — mirrors LiveScoreBlock for wallets. */
+export function TxLiveModelBlock({ txModel }) {
+  if (!txModel) return null;
+  const color = riskColor(txModel.prob);
+  const pct = Math.max(2, (txModel.prob || 0) * 100);
+
+  return (
+    <div className="space-y-3 mt-3">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <span className="text-gray-400 text-sm">Fraud risk — live transaction model</span>
+        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-yellow-900/40 text-yellow-300 border border-yellow-700/50">
+          experimental
+        </span>
+      </div>
+
+      <div className="bg-surface-2 rounded-lg p-3 space-y-3">
+        {/* Probability bar */}
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-gray-400">Probability</span>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-white tabular-nums">{formatProb(txModel.prob)}</span>
+              {txModel.flag && (
+                <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-900/40 text-red-300 border border-red-700/50">
+                  Above threshold
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="h-2 bg-surface-3 rounded overflow-hidden">
+            <div className="h-full rounded" style={{ width: `${pct}%`, backgroundColor: color }} />
+          </div>
+        </div>
+
+        {/* OOD banner */}
+        {txModel.ood_flag && (
+          <div className="text-sm text-yellow-300 bg-yellow-900/20 border border-yellow-700/40 rounded p-2">
+            ⚠ Out of training distribution — score unreliable
+            {txModel.ood?.out_of_range?.length > 0 && (
+              <div className="text-[11px] text-yellow-200/70 mt-1 space-y-0.5">
+                {txModel.ood.out_of_range.map((o, i) => (
+                  <div key={i}>
+                    {o.label}: {(o.value ?? 0).toFixed(4)} (training range: {(o.low ?? 0).toFixed(4)} – {(o.high ?? 0).toFixed(4)})
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* SHAP explanations */}
+        {txModel.explanations?.length > 0 && (
+          <div>
+            <div className="text-xs text-gray-500 mb-2">SHAP values (log-odds) — why this score</div>
+            <FeatureChart features={txModel.explanations} decomposition={txModel.decomposition} />
+          </div>
+        )}
+      </div>
+
+      {/* Footnote */}
+      <p className="text-[11px] text-gray-500 leading-snug">
+        Trained on Elliptic++ (2016–2017) using only interpretable features; the original
+        transaction model relies on anonymised features that cannot be computed for live transactions.
+      </p>
+    </div>
   );
 }
 

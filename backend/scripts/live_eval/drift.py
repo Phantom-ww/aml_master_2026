@@ -381,6 +381,94 @@ def main() -> None:
     print(f"\nOutputs saved to {out_dir}")
     print(f"  drift.csv, drift.md, drift_top.png")
 
+    # === Tx drift ===
+    run_tx_drift(data_dir, model_dir, out_dir)
+
+
+# ---------------------------------------------------------------------------
+# Tx drift section
+# ---------------------------------------------------------------------------
+
+def run_tx_drift(data_dir: Path, model_dir: Path, out_dir: Path) -> None:
+    """Compute KS + PSI for tx features and append a Transactions section to drift.md."""
+    import gzip as _gzip
+    from chain.live_features import tx_live_features_from_esplora, LIVE_TX_FEATURES, TX_CONTEXT_FEATURES
+
+    tx_labels_path = data_dir / "tx_labels.csv"
+    tx_meta_path = model_dir / "live_tx_model_meta.json"
+    tx_ref_path = model_dir / "live_tx_reference_sample.parquet"
+
+    missing_files = [p for p in (tx_labels_path, tx_meta_path, tx_ref_path) if not p.exists()]
+    if missing_files:
+        print(f"\n[tx drift] Skipping — missing files: {[str(p) for p in missing_files]}")
+        return
+
+    with open(tx_meta_path) as f:
+        tx_meta = json.load(f)
+    all_tx_features = LIVE_TX_FEATURES + TX_CONTEXT_FEATURES
+
+    tx_ref_df = pd.read_parquet(tx_ref_path, columns=[f for f in all_tx_features if f != "txid"])
+    print(f"\n[tx drift] Tx reference sample: {len(tx_ref_df)} rows")
+
+    tx_labels = pd.read_csv(tx_labels_path)
+    tx_neg_labels = tx_labels[tx_labels["y"] == 0]
+    tx_pos_labels = tx_labels[tx_labels["y"] == 1]
+
+    def _extract_tx_features(label_df: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for _, row in label_df.iterrows():
+            raw_path = row.get("raw_path", "")
+            if not raw_path or not Path(raw_path).exists():
+                continue
+            with _gzip.open(raw_path, "rt", encoding="utf-8") as f:
+                tx = json.load(f)
+            try:
+                feats, _ = tx_live_features_from_esplora(tx)
+                feats["y"] = int(row["y"])
+                rows.append(feats)
+            except Exception:
+                continue
+        if not rows:
+            return pd.DataFrame(columns=all_tx_features + ["y"])
+        return pd.DataFrame(rows)
+
+    live_tx_neg = _extract_tx_features(tx_neg_labels)
+    live_tx_pos = _extract_tx_features(tx_pos_labels)
+    print(f"  [tx drift] Negatives: {len(live_tx_neg)}, Positives: {len(live_tx_pos)}")
+
+    # Compute drift using the same logic as wallet drift
+    tx_drift_rows = compute_drift(tx_ref_df, live_tx_neg, tx_meta, mode="tx")
+    print(f"  [tx drift] {len(tx_drift_rows)} features computed")
+
+    # Save drift_tx_top.png
+    plot_drift_top(tx_ref_df, live_tx_neg, live_tx_pos, tx_drift_rows, out_dir / "drift_tx_top.png")
+    print(f"  [tx drift] Saved {out_dir / 'drift_tx_top.png'}")
+
+    # Append "## Transactions" section to drift.md
+    drift_md_path = out_dir / "drift.md"
+    if tx_drift_rows:
+        df_tx_drift = pd.DataFrame(tx_drift_rows).sort_values("psi", ascending=False, na_position="last")
+        lines = [
+            "",
+            "## Transactions",
+            "",
+            "KS and PSI statistics for the live transaction model features, "
+            "comparing the Elliptic++ training reference to live negatives "
+            "(random non-coinbase transactions from sampled blocks).",
+            "",
+            "| Feature | Label | KS stat | KS p-value | PSI | Interpretation |",
+            "|---|---|---|---|---|---|",
+        ]
+        for _, r in df_tx_drift.iterrows():
+            psi_str = f"{r['psi']:.4f}" if r["psi"] is not None else "n/a"
+            lines.append(
+                f"| `{r['feature']}` | {r['label']} | {r['ks_stat']:.4f} |"
+                f" {r['ks_pvalue']:.4g} | {psi_str} | {r['interpretation']} |"
+            )
+        with open(drift_md_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"  [tx drift] Appended Transactions section to {drift_md_path}")
+
 
 if __name__ == "__main__":
     main()
